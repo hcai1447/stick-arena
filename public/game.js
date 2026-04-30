@@ -18,6 +18,10 @@
 
   // ============ 常量 ============
   const PLAYER_SPEED = 3;
+  const FIXED_DT = 1 / 60; // 固定逻辑步长 60fps
+  const LERP_SPEED = 0.15; // 远程玩家插值速度
+  const LOCAL_SMOOTH = 0.25; // 本地位置修正平滑系数
+  const BODY_LEAN_FACTOR = 0.15; // 身体倾斜系数
 
   // ============ 状态 ============
   let ws = null;
@@ -37,13 +41,20 @@
   // 客户端预测
   let localX = 0, localY = 0, localFacing = 0;
   let localInputX = 0, localInputY = 0;
-  let lastServerX = 0, lastServerY = 0;
   let lastInputSend = 0;
-  const INPUT_SEND_INTERVAL = 33; // ~30fps 发送输入
+  const INPUT_SEND_INTERVAL = 33;
 
-  // 虚拟摇杆状态
+  // 远程玩家插值缓存（每个玩家存上一个和当前服务器位置）
+  const remoteState = {}; // slot -> { prevX, prevY, curX, curY, curFacing, curMoving, t }
+
+  // 固定步长累加器
+  let accumulator = 0;
+  let lastFrameTime = performance.now();
+
+  // 虚拟摇杆
   let joyActive = false;
   let joyX = 0, joyY = 0;
+  let joyTouchId = null;
   const JOY_RADIUS = 50;
 
   // ============ Canvas 自适应 ============
@@ -54,16 +65,23 @@
   window.addEventListener('resize', resizeCanvas);
   resizeCanvas();
 
-  // ============ 缩放计算 ============
+  // ============ 缩放 ============
   function getScale() {
     return Math.min(canvas.width / arena.w, canvas.height / arena.h);
   }
   function getOffset() {
     const s = getScale();
-    return {
-      x: (canvas.width - arena.w * s) / 2,
-      y: (canvas.height - arena.h * s) / 2,
-    };
+    return { x: (canvas.width - arena.w * s) / 2, y: (canvas.height - arena.h * s) / 2 };
+  }
+
+  // ============ 平滑插值工具 ============
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function angleLerp(a, b, t) {
+    let diff = b - a;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    return a + diff * t;
   }
 
   // ============ WebSocket ============
@@ -75,20 +93,12 @@
       statusEl.textContent = '已连接服务器';
       joinBtn.disabled = false;
     };
-
-    ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      handleMessage(msg);
-    };
-
+    ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
     ws.onclose = () => {
       statusEl.textContent = '连接断开，3秒后重连...';
       setTimeout(connect, 3000);
     };
-
-    ws.onerror = () => {
-      statusEl.textContent = '连接失败';
-    };
+    ws.onerror = () => { statusEl.textContent = '连接失败'; };
   }
 
   function send(msg) {
@@ -126,44 +136,57 @@
 
       case 'playerLeft':
         statusEl.textContent = `有玩家离开了 (${msg.playerCount}/4)`;
+        delete remoteState[msg.slot];
         break;
 
       case 'roundStart':
         gameOverEl.style.display = 'none';
         particles = [];
+        for (const key in remoteState) delete remoteState[key];
         break;
 
       case 'state':
-        // 用服务器状态更新其他玩家，本地玩家用服务器位置做校正
         for (const p of msg.players) {
           if (p.name) names[p.slot] = p.name;
+
           if (p.slot === mySlot) {
-            lastServerX = p.x;
-            lastServerY = p.y;
+            // 本地玩家：校正位置
             const dx = p.x - localX;
             const dy = p.y - localY;
             if (Math.abs(dx) > 30 || Math.abs(dy) > 30) {
               localX = p.x;
               localY = p.y;
-            } else {
-              localX += dx * 0.3;
-              localY += dy * 0.3;
             }
-            // 不覆盖本地facing和moving，由预测控制
-            p.x = localX;
-            p.y = localY;
-            p.facing = localFacing;
-            p.moving = (localInputX !== 0 || localInputY !== 0);
+            // facing和moving由本地预测控制，不覆盖
+          } else {
+            // 远程玩家：存入插值缓冲
+            if (!remoteState[p.slot]) {
+              remoteState[p.slot] = {
+                prevX: p.x, prevY: p.y,
+                curX: p.x, curY: p.y,
+                curFacing: p.facing, curMoving: p.moving,
+                t: 1
+              };
+            } else {
+              const rs = remoteState[p.slot];
+              rs.prevX = rs.curX;
+              rs.prevY = rs.curY;
+              rs.curX = p.x;
+              rs.curY = p.y;
+              rs.curFacing = p.facing;
+              rs.curMoving = p.moving;
+              rs.t = 0; // 重置插值进度
+            }
           }
         }
         gameState = msg.players;
         updateHUD();
         break;
 
-      case 'hit':
+      case 'hit': {
         const target = msg.target;
-        if (gameState && gameState[target]) {
-          const p = gameState[target];
+        const p = getRenderState(target);
+        if (p) {
           spawnHitParticles(p.x, p.y, colors[target]);
           if (target === mySlot) {
             shakeTimer = 8;
@@ -171,6 +194,7 @@
           }
         }
         break;
+      }
 
       case 'gameOver':
         if (msg.scores) {
@@ -185,6 +209,36 @@
         statusEl.textContent = msg.reason;
         break;
     }
+  }
+
+  // 获取玩家的渲染状态（远程玩家用插值后的位置）
+  function getRenderState(slot) {
+    if (!gameState) return null;
+    const base = gameState.find(p => p.slot === slot);
+    if (!base) return null;
+
+    if (slot === mySlot) {
+      return {
+        ...base,
+        x: localX,
+        y: localY,
+        facing: localFacing,
+        moving: (localInputX !== 0 || localInputY !== 0)
+      };
+    }
+
+    const rs = remoteState[slot];
+    if (rs && rs.t < 1) {
+      return {
+        ...base,
+        x: lerp(rs.prevX, rs.curX, rs.t),
+        y: lerp(rs.prevY, rs.curY, rs.t),
+        facing: rs.curFacing,
+        moving: rs.curMoving
+      };
+    }
+
+    return base;
   }
 
   // ============ HUD ============
@@ -210,31 +264,30 @@
     gameOverEl.style.display = 'none';
   });
 
-  // ============ 客户端预测移动 ============
-  function applyLocalPrediction() {
+  // ============ 固定步长逻辑更新 ============
+  function fixedUpdate() {
     if (mySlot < 0 || !gameState) return;
-    const me = gameState.find(p => p.slot === mySlot);
-    if (!me || !me.alive) return;
 
+    // 本地预测
     const len = Math.sqrt(localInputX * localInputX + localInputY * localInputY);
     if (len > 0.1) {
       localX += (localInputX / len) * PLAYER_SPEED;
       localY += (localInputY / len) * PLAYER_SPEED;
-      localFacing = Math.atan2(localInputY, localInputX);
+      localFacing = angleLerp(localFacing, Math.atan2(localInputY, localInputX), 0.3);
     }
-
-    // 边界
     localX = Math.max(12, Math.min(arena.w - 12, localX));
     localY = Math.max(12, Math.min(arena.h - 12, localY));
 
-    // 所有渲染相关属性都用本地值
-    me.x = localX;
-    me.y = localY;
-    me.facing = localFacing;
-    me.moving = len > 0.1;
+    // 远程玩家插值推进
+    for (const slot in remoteState) {
+      const rs = remoteState[slot];
+      if (rs.t < 1) {
+        rs.t = Math.min(1, rs.t + LERP_SPEED);
+      }
+    }
   }
 
-  // ============ 粒子效果 ============
+  // ============ 粒子 ============
   function spawnHitParticles(x, y, color) {
     for (let i = 0; i < 8; i++) {
       const angle = Math.random() * Math.PI * 2;
@@ -262,7 +315,7 @@
   }
 
   // ============ 绘制火柴人 ============
-  function drawStickFigure(x, y, facing, color, moving, alive, attacking, hp, slot) {
+  function drawStickFigure(x, y, facing, color, moving, alive, attacking, hp, slot, velX, velY) {
     const s = getScale();
     const o = getOffset();
     const sx = o.x + x * s;
@@ -276,10 +329,8 @@
       ctx.strokeStyle = color;
       ctx.lineWidth = 2 * s;
       ctx.beginPath();
-      ctx.moveTo(sx - 8 * s, sy - 8 * s);
-      ctx.lineTo(sx + 8 * s, sy + 8 * s);
-      ctx.moveTo(sx + 8 * s, sy - 8 * s);
-      ctx.lineTo(sx - 8 * s, sy + 8 * s);
+      ctx.moveTo(sx - 8 * s, sy - 8 * s); ctx.lineTo(sx + 8 * s, sy + 8 * s);
+      ctx.moveTo(sx + 8 * s, sy - 8 * s); ctx.lineTo(sx - 8 * s, sy + 8 * s);
       ctx.stroke();
       ctx.globalAlpha = 1;
       return;
@@ -290,78 +341,69 @@
     ctx.lineWidth = 2.5 * s;
     ctx.lineCap = 'round';
 
-    if (hp <= 1 && animFrame % 10 < 5) {
-      ctx.globalAlpha = 0.5;
-    }
+    if (hp <= 1 && animFrame % 10 < 5) ctx.globalAlpha = 0.5;
+    if (attacking) { ctx.shadowColor = color; ctx.shadowBlur = 15 * s; }
 
-    if (attacking) {
-      ctx.shadowColor = color;
-      ctx.shadowBlur = 15 * s;
-    }
+    // 动画：速度决定摆动频率，不再是固定帧率
+    const speed = Math.sqrt(velX * velX + velY * velY);
+    const walkPhase = moving ? (animFrame * 0.15 * Math.max(speed, 1)) : 0;
+    const walkCycle = Math.sin(walkPhase);
 
-    const walkCycle = moving ? Math.sin(animFrame * 0.3) : 0;
+    // 身体倾斜：跟随速度方向
+    const leanAngle = moving ? Math.atan2(velY, velX) : facing;
+    const leanTilt = moving ? Math.min(speed * 0.02, BODY_LEAN_FACTOR) : 0;
+    const bodyTiltX = Math.cos(leanAngle) * leanTilt * bodyLen;
+    const bodyTiltY = Math.sin(leanAngle) * leanTilt * bodyLen;
 
-    // 身体
     const bodyTop = sy - bodyLen * 0.3;
     const bodyBot = sy + bodyLen * 0.7;
+    const topX = sx + bodyTiltX;
+    const topY = bodyTop + bodyTiltY;
+    const botX = sx - bodyTiltX;
+    const botY = bodyBot - bodyTiltY;
+
+    // 身体
     ctx.beginPath();
-    ctx.moveTo(sx, bodyTop);
-    ctx.lineTo(sx, bodyBot);
+    ctx.moveTo(topX, topY);
+    ctx.lineTo(botX, botY);
     ctx.stroke();
 
     // 头
     ctx.beginPath();
-    ctx.arc(sx, bodyTop - r * 0.7, r * 0.6, 0, Math.PI * 2);
+    ctx.arc(topX, topY - r * 0.7, r * 0.6, 0, Math.PI * 2);
     ctx.stroke();
 
     // 手臂
-    const armY = bodyTop + bodyLen * 0.3;
+    const armY = topY + bodyLen * 0.3;
+    const armCenterX = lerp(topX, botX, 0.3);
     const armSpread = moving ? walkCycle * 0.4 : 0;
+
     if (attacking) {
       const fX = sx + Math.cos(facing) * limbLen * 1.5;
       const fY = armY + Math.sin(facing) * limbLen * 1.5;
-      ctx.beginPath();
-      ctx.moveTo(sx, armY);
-      ctx.lineTo(fX, fY);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(fX, fY, 3 * s, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.beginPath(); ctx.moveTo(armCenterX, armY); ctx.lineTo(fX, fY); ctx.stroke();
+      ctx.beginPath(); ctx.arc(fX, fY, 3 * s, 0, Math.PI * 2); ctx.fill();
       const bX = sx - Math.cos(facing) * limbLen * 0.5;
       const bY = armY - Math.sin(facing) * limbLen * 0.5;
-      ctx.beginPath();
-      ctx.moveTo(sx, armY);
-      ctx.lineTo(bX, bY);
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(armCenterX, armY); ctx.lineTo(bX, bY); ctx.stroke();
     } else {
-      const a1x = sx + Math.cos(facing + Math.PI / 2 + armSpread) * limbLen;
+      const a1x = armCenterX + Math.cos(facing + Math.PI / 2 + armSpread) * limbLen;
       const a1y = armY + Math.sin(facing + Math.PI / 2 + armSpread) * limbLen * 0.5;
-      const a2x = sx + Math.cos(facing - Math.PI / 2 - armSpread) * limbLen;
+      const a2x = armCenterX + Math.cos(facing - Math.PI / 2 - armSpread) * limbLen;
       const a2y = armY + Math.sin(facing - Math.PI / 2 - armSpread) * limbLen * 0.5;
-      ctx.beginPath();
-      ctx.moveTo(sx, armY);
-      ctx.lineTo(a1x, a1y);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(sx, armY);
-      ctx.lineTo(a2x, a2y);
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(armCenterX, armY); ctx.lineTo(a1x, a1y); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(armCenterX, armY); ctx.lineTo(a2x, a2y); ctx.stroke();
     }
 
-    // 腿
+    // 腿：与手臂反相摆动
     const legSpread = moving ? walkCycle * 0.5 : 0;
-    const l1x = sx + Math.cos(facing + Math.PI * 0.7 + legSpread) * limbLen;
-    const l1y = bodyBot + Math.abs(Math.sin(facing + Math.PI * 0.7 + legSpread)) * limbLen;
-    const l2x = sx + Math.cos(facing + Math.PI * 1.3 - legSpread) * limbLen;
-    const l2y = bodyBot + Math.abs(Math.sin(facing + Math.PI * 1.3 - legSpread)) * limbLen;
-    ctx.beginPath();
-    ctx.moveTo(sx, bodyBot);
-    ctx.lineTo(l1x, l1y);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(sx, bodyBot);
-    ctx.lineTo(l2x, l2y);
-    ctx.stroke();
+    const legCenterX = botX;
+    const l1x = legCenterX + Math.cos(facing + Math.PI * 0.7 - legSpread) * limbLen;
+    const l1y = botY + Math.abs(Math.sin(facing + Math.PI * 0.7 - legSpread)) * limbLen;
+    const l2x = legCenterX + Math.cos(facing + Math.PI * 1.3 + legSpread) * limbLen;
+    const l2y = botY + Math.abs(Math.sin(facing + Math.PI * 1.3 + legSpread)) * limbLen;
+    ctx.beginPath(); ctx.moveTo(legCenterX, botY); ctx.lineTo(l1x, l1y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(legCenterX, botY); ctx.lineTo(l2x, l2y); ctx.stroke();
 
     ctx.shadowBlur = 0;
     ctx.globalAlpha = 1;
@@ -370,7 +412,7 @@
     const barW = 24 * s;
     const barH = 3 * s;
     const barX = sx - barW / 2;
-    const barY = sy - bodyLen - r - 10 * s;
+    const barY = Math.min(topY, topY - r) - 14 * s;
     ctx.fillStyle = '#333';
     ctx.fillRect(barX, barY, barW, barH);
     const hpRatio = hp / maxHp;
@@ -384,7 +426,7 @@
     ctx.fillText(names[slot], sx, barY - 4 * s);
   }
 
-  // ============ 绘制地图 ============
+  // ============ 地图 ============
   function drawArena() {
     const s = getScale();
     const o = getOffset();
@@ -395,16 +437,10 @@
     ctx.strokeStyle = 'rgba(255,255,255,0.05)';
     ctx.lineWidth = 1;
     for (let gx = 0; gx <= arena.w; gx += 40) {
-      ctx.beginPath();
-      ctx.moveTo(o.x + gx * s, o.y);
-      ctx.lineTo(o.x + gx * s, o.y + arena.h * s);
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(o.x + gx * s, o.y); ctx.lineTo(o.x + gx * s, o.y + arena.h * s); ctx.stroke();
     }
     for (let gy = 0; gy <= arena.h; gy += 40) {
-      ctx.beginPath();
-      ctx.moveTo(o.x, o.y + gy * s);
-      ctx.lineTo(o.x + arena.w * s, o.y + gy * s);
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(o.x, o.y + gy * s); ctx.lineTo(o.x + arena.w * s, o.y + gy * s); ctx.stroke();
     }
 
     ctx.fillStyle = '#0f3460';
@@ -420,25 +456,35 @@
     ctx.strokeRect(o.x, o.y, arena.w * s, arena.h * s);
   }
 
-  // ============ 绘制粒子 ============
+  // ============ 粒子绘制 ============
   function drawParticles() {
     const s = getScale();
     const o = getOffset();
     for (const p of particles) {
-      const alpha = p.life / p.maxLife;
-      ctx.globalAlpha = alpha;
+      ctx.globalAlpha = p.life / p.maxLife;
       ctx.fillStyle = p.color;
       ctx.fillRect(o.x + p.x * s - p.size / 2, o.y + p.y * s - p.size / 2, p.size, p.size);
     }
     ctx.globalAlpha = 1;
   }
 
-  // ============ 主循环 ============
-  function gameLoop() {
+  // ============ 渲染循环（requestAnimationFrame） ============
+  function render() {
+    const now = performance.now();
+    const rawDt = (now - lastFrameTime) / 1000;
+    lastFrameTime = now;
+
+    // 固定步长累加，防止大dt导致多次update
+    accumulator += Math.min(rawDt, 0.1);
+    while (accumulator >= FIXED_DT) {
+      fixedUpdate();
+      accumulator -= FIXED_DT;
+    }
+
     animFrame++;
     updateParticles();
-    applyLocalPrediction();
 
+    // 屏幕震动
     let sx = 0, sy = 0;
     if (shakeTimer > 0) {
       sx = (Math.random() - 0.5) * shakeIntensity;
@@ -456,35 +502,30 @@
     drawParticles();
 
     if (gameState) {
-      for (const p of gameState) {
+      for (const base of gameState) {
+        const p = getRenderState(base.slot);
+        if (!p) continue;
+        // 估算速度方向用于身体倾斜
+        const rs = remoteState[base.slot];
+        let velX = 0, velY = 0;
+        if (base.slot === mySlot) {
+          velX = localInputX; velY = localInputY;
+        } else if (rs) {
+          velX = rs.curX - rs.prevX; velY = rs.curY - rs.prevY;
+        }
         drawStickFigure(
           p.x, p.y, p.facing, colors[p.slot],
-          p.moving, p.alive, p.attacking, p.hp, p.slot
+          p.moving, p.alive, p.attacking, p.hp, p.slot,
+          velX, velY
         );
       }
     }
 
     ctx.restore();
-    requestAnimationFrame(gameLoop);
+    requestAnimationFrame(render);
   }
 
   // ============ 虚拟摇杆 ============
-  let joyTouchId = null; // 追踪触摸ID
-
-  function handleJoyStart(e) {
-    e.preventDefault();
-    const touch = e.changedTouches ? e.changedTouches[0] : e;
-    joyTouchId = touch.identifier != null ? touch.identifier : 'mouse';
-    joyActive = true;
-    updateJoy(touch.clientX, touch.clientY);
-    // 绑定到window，确保手指滑出摇杆区域也能追踪
-    window.addEventListener('touchmove', handleJoyMove, { passive: false });
-    window.addEventListener('touchend', handleJoyEnd, { passive: false });
-    window.addEventListener('touchcancel', handleJoyEnd, { passive: false });
-    window.addEventListener('mousemove', handleJoyMove);
-    window.addEventListener('mouseup', handleJoyEnd);
-  }
-
   function findTouch(touches) {
     if (joyTouchId === 'mouse') return null;
     for (let i = 0; i < touches.length; i++) {
@@ -500,15 +541,25 @@
     let dx = clientX - cx;
     let dy = clientY - cy;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist > JOY_RADIUS) {
-      dx = (dx / dist) * JOY_RADIUS;
-      dy = (dy / dist) * JOY_RADIUS;
-    }
+    if (dist > JOY_RADIUS) { dx = (dx / dist) * JOY_RADIUS; dy = (dy / dist) * JOY_RADIUS; }
     joystickKnob.style.left = (35 + dx) + 'px';
     joystickKnob.style.top = (35 + dy) + 'px';
     joyX = dx / JOY_RADIUS;
     joyY = dy / JOY_RADIUS;
     sendInput(joyX, joyY);
+  }
+
+  function handleJoyStart(e) {
+    e.preventDefault();
+    const touch = e.changedTouches ? e.changedTouches[0] : e;
+    joyTouchId = touch.identifier != null ? touch.identifier : 'mouse';
+    joyActive = true;
+    updateJoy(touch.clientX, touch.clientY);
+    window.addEventListener('touchmove', handleJoyMove, { passive: false });
+    window.addEventListener('touchend', handleJoyEnd, { passive: false });
+    window.addEventListener('touchcancel', handleJoyEnd, { passive: false });
+    window.addEventListener('mousemove', handleJoyMove);
+    window.addEventListener('mouseup', handleJoyEnd);
   }
 
   function handleJoyMove(e) {
@@ -527,8 +578,7 @@
     if (e.changedTouches && !findTouch(e.changedTouches)) return;
     joyActive = false;
     joyTouchId = null;
-    joyX = 0;
-    joyY = 0;
+    joyX = 0; joyY = 0;
     joystickKnob.style.left = '35px';
     joystickKnob.style.top = '35px';
     sendInput(0, 0);
@@ -542,18 +592,10 @@
   joystickBase.addEventListener('touchstart', handleJoyStart, { passive: false });
   joystickBase.addEventListener('mousedown', handleJoyStart);
 
-  // 攻击 - 用click代替touchstart，更可靠
-  attackBtn.addEventListener('touchstart', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    send({ type: 'attack' });
-  }, { passive: false });
-  attackBtn.addEventListener('click', (e) => {
-    e.preventDefault();
-    send({ type: 'attack' });
-  });
+  attackBtn.addEventListener('touchstart', (e) => { e.preventDefault(); e.stopPropagation(); send({ type: 'attack' }); }, { passive: false });
+  attackBtn.addEventListener('click', (e) => { e.preventDefault(); send({ type: 'attack' }); });
 
-  // ============ 键盘控制（PC端） ============
+  // ============ 键盘 ============
   const keysDown = new Set();
   function updateKeyboardInput() {
     let kx = 0, ky = 0;
@@ -574,18 +616,17 @@
     updateKeyboardInput();
   });
 
-  // ============ 加入游戏 ============
+  // ============ 加入 ============
   joinBtn.addEventListener('click', () => {
     const name = nameInput.value.trim();
     if (!name) { nameInput.focus(); return; }
     joinBtn.disabled = true;
     send({ type: 'join', name });
   });
-  nameInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') joinBtn.click();
-  });
+  nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') joinBtn.click(); });
 
   // ============ 启动 ============
   connect();
-  gameLoop();
+  lastFrameTime = performance.now();
+  requestAnimationFrame(render);
 })();
