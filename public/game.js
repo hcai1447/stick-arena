@@ -461,10 +461,10 @@
 
   joystickBase.addEventListener('touchstart', handleJoyStart, { passive: false });
   joystickBase.addEventListener('mousedown', handleJoyStart);
-  window.addEventListener('touchmove', handleJoyMove, { passive: false });
-  window.addEventListener('mousemove', handleJoyMove);
-  window.addEventListener('touchend', handleJoyEnd);
-  window.addEventListener('mouseup', handleJoyEnd);
+  canvas.addEventListener('touchmove', handleJoyMove, { passive: false });
+  canvas.addEventListener('mousemove', handleJoyMove);
+  canvas.addEventListener('touchend', handleJoyEnd);
+  canvas.addEventListener('mouseup', handleJoyEnd);
 
   // 攻击
   attackBtn.addEventListener('touchstart', (e) => { e.preventDefault(); send({ type: 'attack' }); }, { passive: false });
