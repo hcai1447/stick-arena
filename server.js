@@ -279,6 +279,11 @@ wss.on('connection', (ws) => {
       room.players.set(slot, playerData);
       currentRoom = room;
 
+      // 初始化位置
+      const pos = spawnPos(slot);
+      playerData.x = pos.x;
+      playerData.y = pos.y;
+
       ws.send(JSON.stringify({
         type: 'joined',
         slot,
@@ -299,9 +304,14 @@ wss.on('connection', (ws) => {
         playerCount: room.players.size,
       });
 
-      // 2人以上可以开始
+      // 2人以上开始正式对战，1人也发状态让他看到自己
       if (room.players.size >= 2 && room.state === 'waiting') {
         startRound(room);
+      } else if (room.state === 'waiting') {
+        broadcastRoom(room, {
+          type: 'roundStart',
+        });
+        gameTick(room);
       }
     }
 
