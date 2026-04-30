@@ -206,7 +206,7 @@ function gameTick(room) {
                 type: 'gameOver',
                 winner: p.slot,
                 winnerName: NAMES[p.slot],
-                scores: players.map(pp => ({ slot: pp.slot, score: pp.score || 0 })),
+                scores: players.map(pp => ({ slot: pp.slot, name: pp.name, score: pp.score || 0 })),
               });
               clearTimeout(room.tickTimer);
               return;
@@ -229,6 +229,7 @@ function gameTick(room) {
     type: 'state',
     players: players.map(p => ({
       slot: p.slot,
+      name: p.name,
       x: Math.round(p.x * 10) / 10,
       y: Math.round(p.y * 10) / 10,
       hp: p.hp,

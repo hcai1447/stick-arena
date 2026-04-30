@@ -120,6 +120,9 @@
 
       case 'state':
         gameState = msg.players;
+        for (const p of msg.players) {
+          if (p.name) names[p.slot] = p.name;
+        }
         updateHUD();
         break;
 
@@ -136,6 +139,11 @@
         break;
 
       case 'gameOver':
+        if (msg.scores) {
+          for (const s of msg.scores) {
+            if (s.name) names[s.slot] = s.name;
+          }
+        }
         showGameOver(msg);
         break;
 
