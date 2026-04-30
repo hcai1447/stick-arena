@@ -17,8 +17,10 @@
   const playAgainBtn = document.getElementById('playAgainBtn');
 
   // ============ 常量 ============
-  const PLAYER_SPEED = 3;
-  const FIXED_DT = 1 / 60; // 固定逻辑步长 60fps
+  const SERVER_SPEED = 3;        // 服务器每tick的速度
+  const SERVER_TICK = 1 / 30;    // 服务器tick间隔
+  const FIXED_DT = 1 / 60;      // 客户端逻辑步长 60fps
+  const PLAYER_SPEED = SERVER_SPEED * (FIXED_DT / SERVER_TICK); // 保证总速度一致：每秒 90px
   const LERP_SPEED = 0.15; // 远程玩家插值速度
   const LOCAL_SMOOTH = 0.25; // 本地位置修正平滑系数
   const BODY_LEAN_FACTOR = 0.15; // 身体倾斜系数
