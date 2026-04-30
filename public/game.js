@@ -16,6 +16,9 @@
   const finalScoresEl = document.getElementById('finalScores');
   const playAgainBtn = document.getElementById('playAgainBtn');
 
+  // ============ 常量 ============
+  const PLAYER_SPEED = 3;
+
   // ============ 状态 ============
   let ws = null;
   let mySlot = -1;
@@ -30,6 +33,13 @@
   let particles = [];
   let shakeTimer = 0;
   let shakeIntensity = 0;
+
+  // 客户端预测
+  let localX = 0, localY = 0;
+  let localInputX = 0, localInputY = 0;
+  let lastServerX = 0, lastServerY = 0;
+  let lastInputSend = 0;
+  const INPUT_SEND_INTERVAL = 33; // ~30fps 发送输入
 
   // 虚拟摇杆状态
   let joyActive = false;
@@ -54,11 +64,6 @@
       x: (canvas.width - arena.w * s) / 2,
       y: (canvas.height - arena.h * s) / 2,
     };
-  }
-  function worldToScreen(wx, wy) {
-    const s = getScale();
-    const o = getOffset();
-    return { x: o.x + wx * s, y: o.y + wy * s };
   }
 
   // ============ WebSocket ============
@@ -90,6 +95,16 @@
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
   }
 
+  function sendInput(x, y) {
+    localInputX = x;
+    localInputY = y;
+    const now = Date.now();
+    if (now - lastInputSend >= INPUT_SEND_INTERVAL) {
+      lastInputSend = now;
+      send({ type: 'input', x, y });
+    }
+  }
+
   function handleMessage(msg) {
     switch (msg.type) {
       case 'joined':
@@ -119,10 +134,28 @@
         break;
 
       case 'state':
-        gameState = msg.players;
+        // 用服务器状态更新其他玩家，本地玩家用服务器位置做校正
         for (const p of msg.players) {
           if (p.name) names[p.slot] = p.name;
+          if (p.slot === mySlot) {
+            // 校正本地位置（平滑过渡）
+            lastServerX = p.x;
+            lastServerY = p.y;
+            const dx = p.x - localX;
+            const dy = p.y - localY;
+            // 如果偏差太大直接同步，否则平滑修正
+            if (Math.abs(dx) > 30 || Math.abs(dy) > 30) {
+              localX = p.x;
+              localY = p.y;
+            } else {
+              localX += dx * 0.3;
+              localY += dy * 0.3;
+            }
+            p.x = localX;
+            p.y = localY;
+          }
         }
+        gameState = msg.players;
         updateHUD();
         break;
 
@@ -176,6 +209,28 @@
     gameOverEl.style.display = 'none';
   });
 
+  // ============ 客户端预测移动 ============
+  function applyLocalPrediction() {
+    if (mySlot < 0 || !gameState) return;
+    const me = gameState.find(p => p.slot === mySlot);
+    if (!me || !me.alive) return;
+
+    const len = Math.sqrt(localInputX * localInputX + localInputY * localInputY);
+    if (len > 0) {
+      localX += (localInputX / len) * PLAYER_SPEED;
+      localY += (localInputY / len) * PLAYER_SPEED;
+    }
+
+    // 边界
+    localX = Math.max(12, Math.min(arena.w - 12, localX));
+    localY = Math.max(12, Math.min(arena.h - 12, localY));
+
+    me.x = localX;
+    me.y = localY;
+    me.moving = len > 0;
+    if (len > 0) me.facing = Math.atan2(localInputY, localInputX);
+  }
+
   // ============ 粒子效果 ============
   function spawnHitParticles(x, y, color) {
     for (let i = 0; i < 8; i++) {
@@ -214,7 +269,6 @@
     const limbLen = 12 * s;
 
     if (!alive) {
-      // 死亡 - 画个倒下的X
       ctx.globalAlpha = 0.3;
       ctx.strokeStyle = color;
       ctx.lineWidth = 2 * s;
@@ -233,19 +287,16 @@
     ctx.lineWidth = 2.5 * s;
     ctx.lineCap = 'round';
 
-    // 被攻击闪烁
     if (hp <= 1 && animFrame % 10 < 5) {
       ctx.globalAlpha = 0.5;
     }
 
-    // 攻击时发光
     if (attacking) {
       ctx.shadowColor = color;
       ctx.shadowBlur = 15 * s;
     }
 
     const walkCycle = moving ? Math.sin(animFrame * 0.3) : 0;
-    const attackAnim = attacking ? 1 : 0;
 
     // 身体
     const bodyTop = sy - bodyLen * 0.3;
@@ -260,22 +311,19 @@
     ctx.arc(sx, bodyTop - r * 0.7, r * 0.6, 0, Math.PI * 2);
     ctx.stroke();
 
-    // 手臂 - 攻击时前伸
+    // 手臂
     const armY = bodyTop + bodyLen * 0.3;
     const armSpread = moving ? walkCycle * 0.4 : 0;
     if (attacking) {
-      // 前手冲刺
       const fX = sx + Math.cos(facing) * limbLen * 1.5;
       const fY = armY + Math.sin(facing) * limbLen * 1.5;
       ctx.beginPath();
       ctx.moveTo(sx, armY);
       ctx.lineTo(fX, fY);
       ctx.stroke();
-      // 拳头
       ctx.beginPath();
       ctx.arc(fX, fY, 3 * s, 0, Math.PI * 2);
       ctx.fill();
-      // 后手
       const bX = sx - Math.cos(facing) * limbLen * 0.5;
       const bY = armY - Math.sin(facing) * limbLen * 0.5;
       ctx.beginPath();
@@ -338,11 +386,9 @@
     const s = getScale();
     const o = getOffset();
 
-    // 边框
     ctx.fillStyle = '#16213e';
     ctx.fillRect(o.x, o.y, arena.w * s, arena.h * s);
 
-    // 网格线
     ctx.strokeStyle = 'rgba(255,255,255,0.05)';
     ctx.lineWidth = 1;
     for (let gx = 0; gx <= arena.w; gx += 40) {
@@ -358,7 +404,6 @@
       ctx.stroke();
     }
 
-    // 障碍物
     ctx.fillStyle = '#0f3460';
     ctx.strokeStyle = '#1a5276';
     ctx.lineWidth = 2;
@@ -367,7 +412,6 @@
       ctx.strokeRect(o.x + w.x * s, o.y + w.y * s, w.w * s, w.h * s);
     }
 
-    // 边框线
     ctx.strokeStyle = '#1a5276';
     ctx.lineWidth = 3;
     ctx.strokeRect(o.x, o.y, arena.w * s, arena.h * s);
@@ -390,8 +434,8 @@
   function gameLoop() {
     animFrame++;
     updateParticles();
+    applyLocalPrediction();
 
-    // 屏幕震动
     let sx = 0, sy = 0;
     if (shakeTimer > 0) {
       sx = (Math.random() - 0.5) * shakeIntensity;
@@ -446,7 +490,7 @@
     joystickKnob.style.top = (35 + dy) + 'px';
     joyX = dx / JOY_RADIUS;
     joyY = dy / JOY_RADIUS;
-    send({ type: 'input', x: joyX, y: joyY });
+    sendInput(joyX, joyY);
   }
 
   function handleJoyEnd(e) {
@@ -456,7 +500,7 @@
     joyY = 0;
     joystickKnob.style.left = '35px';
     joystickKnob.style.top = '35px';
-    send({ type: 'input', x: 0, y: 0 });
+    sendInput(0, 0);
   }
 
   joystickBase.addEventListener('touchstart', handleJoyStart, { passive: false });
@@ -478,7 +522,7 @@
     if (keysDown.has('s') || keysDown.has('arrowdown')) ky = 1;
     if (keysDown.has('a') || keysDown.has('arrowleft')) kx = -1;
     if (keysDown.has('d') || keysDown.has('arrowright')) kx = 1;
-    send({ type: 'input', x: kx, y: ky });
+    sendInput(kx, ky);
   }
 
   window.addEventListener('keydown', (e) => {
