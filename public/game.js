@@ -466,21 +466,36 @@
   }
 
   // ============ 虚拟摇杆 ============
+  let joyTouchId = null; // 追踪触摸ID
+
   function handleJoyStart(e) {
     e.preventDefault();
+    const touch = e.changedTouches ? e.changedTouches[0] : e;
+    joyTouchId = touch.identifier != null ? touch.identifier : 'mouse';
     joyActive = true;
-    handleJoyMove(e);
+    updateJoy(touch.clientX, touch.clientY);
+    // 绑定到window，确保手指滑出摇杆区域也能追踪
+    window.addEventListener('touchmove', handleJoyMove, { passive: false });
+    window.addEventListener('touchend', handleJoyEnd, { passive: false });
+    window.addEventListener('touchcancel', handleJoyEnd, { passive: false });
+    window.addEventListener('mousemove', handleJoyMove);
+    window.addEventListener('mouseup', handleJoyEnd);
   }
 
-  function handleJoyMove(e) {
-    if (!joyActive) return;
-    e.preventDefault();
-    const touch = e.touches ? e.touches[0] : e;
+  function findTouch(touches) {
+    if (joyTouchId === 'mouse') return null;
+    for (let i = 0; i < touches.length; i++) {
+      if (touches[i].identifier === joyTouchId) return touches[i];
+    }
+    return null;
+  }
+
+  function updateJoy(clientX, clientY) {
     const rect = joystickBase.getBoundingClientRect();
     const cx = rect.left + rect.width / 2;
     const cy = rect.top + rect.height / 2;
-    let dx = touch.clientX - cx;
-    let dy = touch.clientY - cy;
+    let dx = clientX - cx;
+    let dy = clientY - cy;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist > JOY_RADIUS) {
       dx = (dx / dist) * JOY_RADIUS;
@@ -493,26 +508,47 @@
     sendInput(joyX, joyY);
   }
 
+  function handleJoyMove(e) {
+    if (!joyActive) return;
+    e.preventDefault();
+    if (e.changedTouches) {
+      const touch = findTouch(e.changedTouches);
+      if (!touch) return;
+      updateJoy(touch.clientX, touch.clientY);
+    } else {
+      updateJoy(e.clientX, e.clientY);
+    }
+  }
+
   function handleJoyEnd(e) {
-    if (e) e.preventDefault();
+    if (e.changedTouches && !findTouch(e.changedTouches)) return;
     joyActive = false;
+    joyTouchId = null;
     joyX = 0;
     joyY = 0;
     joystickKnob.style.left = '35px';
     joystickKnob.style.top = '35px';
     sendInput(0, 0);
+    window.removeEventListener('touchmove', handleJoyMove);
+    window.removeEventListener('touchend', handleJoyEnd);
+    window.removeEventListener('touchcancel', handleJoyEnd);
+    window.removeEventListener('mousemove', handleJoyMove);
+    window.removeEventListener('mouseup', handleJoyEnd);
   }
 
   joystickBase.addEventListener('touchstart', handleJoyStart, { passive: false });
   joystickBase.addEventListener('mousedown', handleJoyStart);
-  canvas.addEventListener('touchmove', handleJoyMove, { passive: false });
-  canvas.addEventListener('mousemove', handleJoyMove);
-  canvas.addEventListener('touchend', handleJoyEnd);
-  canvas.addEventListener('mouseup', handleJoyEnd);
 
-  // 攻击
-  attackBtn.addEventListener('touchstart', (e) => { e.preventDefault(); send({ type: 'attack' }); }, { passive: false });
-  attackBtn.addEventListener('mousedown', () => send({ type: 'attack' }));
+  // 攻击 - 用click代替touchstart，更可靠
+  attackBtn.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    send({ type: 'attack' });
+  }, { passive: false });
+  attackBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    send({ type: 'attack' });
+  });
 
   // ============ 键盘控制（PC端） ============
   const keysDown = new Set();
