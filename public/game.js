@@ -150,14 +150,25 @@
           if (p.name) names[p.slot] = p.name;
 
           if (p.slot === mySlot) {
-            // 本地玩家：校正位置
+            // 本地玩家：客户端是渲染的唯一来源
+            // 服务器位置只在严重偏差时硬同步，小偏差完全忽略
             const dx = p.x - localX;
             const dy = p.y - localY;
-            if (Math.abs(dx) > 30 || Math.abs(dy) > 30) {
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > 50) {
+              // 严重偏差（比如被击退、重生），直接同步
               localX = p.x;
               localY = p.y;
             }
-            // facing和moving由本地预测控制，不覆盖
+            // 偏差<50：忽略，不做任何修正，避免"拉扯"
+            // hp、alive、score等非位置属性正常更新
+            const me = gameState ? gameState.find(pp => pp.slot === mySlot) : null;
+            if (me) {
+              me.hp = p.hp;
+              me.alive = p.alive;
+              me.score = p.score;
+              me.attacking = p.attacking;
+            }
           } else {
             // 远程玩家：存入插值缓冲
             if (!remoteState[p.slot]) {
@@ -175,11 +186,14 @@
               rs.curY = p.y;
               rs.curFacing = p.facing;
               rs.curMoving = p.moving;
-              rs.t = 0; // 重置插值进度
+              rs.t = 0;
             }
           }
         }
-        gameState = msg.players;
+        // 只在首次或roundStart时整体赋值，之后只更新非位置属性
+        if (!gameState || gameState.length !== msg.players.length) {
+          gameState = msg.players;
+        }
         updateHUD();
         break;
 
