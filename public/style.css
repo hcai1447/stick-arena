@@ -4,7 +4,7 @@ html, body {
   background: #1a1a2e;
   font-family: 'Courier New', monospace;
   overflow: hidden;
-  touch-action: none;
+  touch-action: manipulation;
   user-select: none;
   -webkit-user-select: none;
 }
@@ -21,8 +21,11 @@ html, body {
 #lobby p { color: #888; font-size: 14px; }
 #nameInput {
   background: #16213e; border: 2px solid #0f3460; color: #eee;
-  padding: 12px 20px; font-size: 16px; font-family: inherit;
-  border-radius: 4px; text-align: center; width: 240px;
+  padding: 14px 20px; font-size: 16px; font-family: inherit;
+  border-radius: 4px; text-align: center; width: 260px;
+  touch-action: manipulation;
+  -webkit-appearance: none;
+  appearance: none;
 }
 #joinBtn {
   background: #e74c3c; border: none; color: #fff;
