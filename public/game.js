@@ -16,15 +16,6 @@
   const finalScoresEl = document.getElementById('finalScores');
   const playAgainBtn = document.getElementById('playAgainBtn');
 
-  // ============ 常量 ============
-  const SERVER_SPEED = 3;        // 服务器每tick的速度
-  const SERVER_TICK = 1 / 30;    // 服务器tick间隔
-  const FIXED_DT = 1 / 60;      // 客户端逻辑步长 60fps
-  const PLAYER_SPEED = SERVER_SPEED * (FIXED_DT / SERVER_TICK); // 保证总速度一致：每秒 90px
-  const LERP_SPEED = 0.15; // 远程玩家插值速度
-  const LOCAL_SMOOTH = 0.25; // 本地位置修正平滑系数
-  const BODY_LEAN_FACTOR = 0.15; // 身体倾斜系数
-
   // ============ 状态 ============
   let ws = null;
   let mySlot = -1;
@@ -40,22 +31,16 @@
   let shakeTimer = 0;
   let shakeIntensity = 0;
 
-  // 客户端预测
-  let localX = 0, localY = 0, localFacing = 0;
-  let localInputX = 0, localInputY = 0;
+  // 远程玩家插值（所有玩家都用同一套，包括自己）
+  const interp = {}; // slot -> { prevX, prevY, curX, curY, curFacing, curMoving, curAttacking, t }
+
+  // 输入
+  let currentInputX = 0, currentInputY = 0;
   let lastInputSend = 0;
   const INPUT_SEND_INTERVAL = 33;
 
-  // 远程玩家插值缓存（每个玩家存上一个和当前服务器位置）
-  const remoteState = {}; // slot -> { prevX, prevY, curX, curY, curFacing, curMoving, t }
-
-  // 固定步长累加器
-  let accumulator = 0;
-  let lastFrameTime = performance.now();
-
   // 虚拟摇杆
   let joyActive = false;
-  let joyX = 0, joyY = 0;
   let joyTouchId = null;
   const JOY_RADIUS = 50;
 
@@ -76,15 +61,8 @@
     return { x: (canvas.width - arena.w * s) / 2, y: (canvas.height - arena.h * s) / 2 };
   }
 
-  // ============ 平滑插值工具 ============
-  function lerp(a, b, t) { return a + (b - a) * t; }
-
-  function angleLerp(a, b, t) {
-    let diff = b - a;
-    while (diff > Math.PI) diff -= Math.PI * 2;
-    while (diff < -Math.PI) diff += Math.PI * 2;
-    return a + diff * t;
-  }
+  // ============ 平滑工具 ============
+  function lerp(a, b, t) { return a + (b - a) * Math.min(t, 1); }
 
   // ============ WebSocket ============
   function connect() {
@@ -108,8 +86,8 @@
   }
 
   function sendInput(x, y) {
-    localInputX = x;
-    localInputY = y;
+    currentInputX = x;
+    currentInputY = y;
     const now = Date.now();
     if (now - lastInputSend >= INPUT_SEND_INTERVAL) {
       lastInputSend = now;
@@ -138,64 +116,42 @@
 
       case 'playerLeft':
         statusEl.textContent = `有玩家离开了 (${msg.playerCount}/4)`;
-        delete remoteState[msg.slot];
+        delete interp[msg.slot];
         break;
 
       case 'roundStart':
         gameOverEl.style.display = 'none';
         particles = [];
-        for (const key in remoteState) delete remoteState[key];
+        for (const key in interp) delete interp[key];
         break;
 
       case 'state':
+        // 服务器是唯一权威，所有玩家位置都用插值平滑
         for (const p of msg.players) {
           if (p.name) names[p.slot] = p.name;
 
-          if (p.slot === mySlot) {
-            // 本地玩家：客户端是渲染的唯一来源
-            // 服务器位置只在严重偏差时硬同步，小偏差完全忽略
-            const dx = p.x - localX;
-            const dy = p.y - localY;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist > 50) {
-              // 严重偏差（比如被击退、重生），直接同步
-              localX = p.x;
-              localY = p.y;
-            }
-            // 偏差<50：忽略，不做任何修正，避免"拉扯"
-            // hp、alive、score等非位置属性正常更新
-            const me = gameState ? gameState.find(pp => pp.slot === mySlot) : null;
-            if (me) {
-              me.hp = p.hp;
-              me.alive = p.alive;
-              me.score = p.score;
-              me.attacking = p.attacking;
-            }
+          if (!interp[p.slot]) {
+            interp[p.slot] = {
+              prevX: p.x, prevY: p.y,
+              curX: p.x, curY: p.y,
+              curFacing: p.facing, curMoving: p.moving,
+              curAttacking: p.attacking,
+              t: 1
+            };
           } else {
-            // 远程玩家：存入插值缓冲
-            if (!remoteState[p.slot]) {
-              remoteState[p.slot] = {
-                prevX: p.x, prevY: p.y,
-                curX: p.x, curY: p.y,
-                curFacing: p.facing, curMoving: p.moving,
-                t: 1
-              };
-            } else {
-              const rs = remoteState[p.slot];
-              rs.prevX = rs.curX;
-              rs.prevY = rs.curY;
-              rs.curX = p.x;
-              rs.curY = p.y;
-              rs.curFacing = p.facing;
-              rs.curMoving = p.moving;
-              rs.t = 0;
-            }
+            const s = interp[p.slot];
+            // 保存上一个位置作为插值起点
+            s.prevX = getInterpX(p.slot);
+            s.prevY = getInterpY(p.slot);
+            s.curX = p.x;
+            s.curY = p.y;
+            s.curFacing = p.facing;
+            s.curMoving = p.moving;
+            s.curAttacking = p.attacking;
+            s.t = 0; // 重置插值
           }
         }
-        // 只在首次或roundStart时整体赋值，之后只更新非位置属性
-        if (!gameState || gameState.length !== msg.players.length) {
-          gameState = msg.players;
-        }
+        gameState = msg.players;
         updateHUD();
         break;
 
@@ -227,34 +183,35 @@
     }
   }
 
-  // 获取玩家的渲染状态（远程玩家用插值后的位置）
+  // 获取插值后的当前位置
+  function getInterpX(slot) {
+    const s = interp[slot];
+    if (!s) return 0;
+    return lerp(s.prevX, s.curX, s.t);
+  }
+  function getInterpY(slot) {
+    const s = interp[slot];
+    if (!s) return 0;
+    return lerp(s.prevY, s.curY, s.t);
+  }
+
+  // 获取渲染状态
   function getRenderState(slot) {
     if (!gameState) return null;
     const base = gameState.find(p => p.slot === slot);
     if (!base) return null;
 
-    if (slot === mySlot) {
-      return {
-        ...base,
-        x: localX,
-        y: localY,
-        facing: localFacing,
-        moving: (localInputX !== 0 || localInputY !== 0)
-      };
-    }
+    const s = interp[slot];
+    if (!s) return base;
 
-    const rs = remoteState[slot];
-    if (rs && rs.t < 1) {
-      return {
-        ...base,
-        x: lerp(rs.prevX, rs.curX, rs.t),
-        y: lerp(rs.prevY, rs.curY, rs.t),
-        facing: rs.curFacing,
-        moving: rs.curMoving
-      };
-    }
-
-    return base;
+    return {
+      ...base,
+      x: lerp(s.prevX, s.curX, s.t),
+      y: lerp(s.prevY, s.curY, s.t),
+      facing: s.curFacing,
+      moving: s.curMoving,
+      attacking: s.curAttacking,
+    };
   }
 
   // ============ HUD ============
@@ -279,29 +236,6 @@
     send({ type: 'join', name: nameInput.value.trim() || '' });
     gameOverEl.style.display = 'none';
   });
-
-  // ============ 固定步长逻辑更新 ============
-  function fixedUpdate() {
-    if (mySlot < 0 || !gameState) return;
-
-    // 本地预测
-    const len = Math.sqrt(localInputX * localInputX + localInputY * localInputY);
-    if (len > 0.1) {
-      localX += (localInputX / len) * PLAYER_SPEED;
-      localY += (localInputY / len) * PLAYER_SPEED;
-      localFacing = angleLerp(localFacing, Math.atan2(localInputY, localInputX), 0.3);
-    }
-    localX = Math.max(12, Math.min(arena.w - 12, localX));
-    localY = Math.max(12, Math.min(arena.h - 12, localY));
-
-    // 远程玩家插值推进
-    for (const slot in remoteState) {
-      const rs = remoteState[slot];
-      if (rs.t < 1) {
-        rs.t = Math.min(1, rs.t + LERP_SPEED);
-      }
-    }
-  }
 
   // ============ 粒子 ============
   function spawnHitParticles(x, y, color) {
@@ -360,14 +294,14 @@
     if (hp <= 1 && animFrame % 10 < 5) ctx.globalAlpha = 0.5;
     if (attacking) { ctx.shadowColor = color; ctx.shadowBlur = 15 * s; }
 
-    // 动画：速度决定摆动频率，不再是固定帧率
+    // 动画：速度决定摆动频率
     const speed = Math.sqrt(velX * velX + velY * velY);
     const walkPhase = moving ? (animFrame * 0.15 * Math.max(speed, 1)) : 0;
     const walkCycle = Math.sin(walkPhase);
 
-    // 身体倾斜：跟随速度方向
+    // 身体倾斜
     const leanAngle = moving ? Math.atan2(velY, velX) : facing;
-    const leanTilt = moving ? Math.min(speed * 0.02, BODY_LEAN_FACTOR) : 0;
+    const leanTilt = moving ? Math.min(speed * 0.02, 0.15) : 0;
     const bodyTiltX = Math.cos(leanAngle) * leanTilt * bodyLen;
     const bodyTiltY = Math.sin(leanAngle) * leanTilt * bodyLen;
 
@@ -411,7 +345,7 @@
       ctx.beginPath(); ctx.moveTo(armCenterX, armY); ctx.lineTo(a2x, a2y); ctx.stroke();
     }
 
-    // 腿：与手臂反相摆动
+    // 腿（与手臂反相）
     const legSpread = moving ? walkCycle * 0.5 : 0;
     const legCenterX = botX;
     const l1x = legCenterX + Math.cos(facing + Math.PI * 0.7 - legSpread) * limbLen;
@@ -484,21 +418,16 @@
     ctx.globalAlpha = 1;
   }
 
-  // ============ 渲染循环（requestAnimationFrame） ============
+  // ============ 渲染循环 ============
   function render() {
-    const now = performance.now();
-    const rawDt = (now - lastFrameTime) / 1000;
-    lastFrameTime = now;
-
-    // 固定步长累加，防止大dt导致多次update
-    accumulator += Math.min(rawDt, 0.1);
-    while (accumulator >= FIXED_DT) {
-      fixedUpdate();
-      accumulator -= FIXED_DT;
-    }
-
     animFrame++;
     updateParticles();
+
+    // 推进所有插值
+    for (const slot in interp) {
+      const s = interp[slot];
+      if (s.t < 1) s.t = Math.min(1, s.t + 0.2); // 5帧插值完
+    }
 
     // 屏幕震动
     let sx = 0, sy = 0;
@@ -521,13 +450,12 @@
       for (const base of gameState) {
         const p = getRenderState(base.slot);
         if (!p) continue;
-        // 估算速度方向用于身体倾斜
-        const rs = remoteState[base.slot];
+        // 速度方向用于身体倾斜
+        const st = interp[base.slot];
         let velX = 0, velY = 0;
-        if (base.slot === mySlot) {
-          velX = localInputX; velY = localInputY;
-        } else if (rs) {
-          velX = rs.curX - rs.prevX; velY = rs.curY - rs.prevY;
+        if (st) {
+          velX = st.curX - st.prevX;
+          velY = st.curY - st.prevY;
         }
         drawStickFigure(
           p.x, p.y, p.facing, colors[p.slot],
@@ -560,9 +488,7 @@
     if (dist > JOY_RADIUS) { dx = (dx / dist) * JOY_RADIUS; dy = (dy / dist) * JOY_RADIUS; }
     joystickKnob.style.left = (35 + dx) + 'px';
     joystickKnob.style.top = (35 + dy) + 'px';
-    joyX = dx / JOY_RADIUS;
-    joyY = dy / JOY_RADIUS;
-    sendInput(joyX, joyY);
+    sendInput(dx / JOY_RADIUS, dy / JOY_RADIUS);
   }
 
   function handleJoyStart(e) {
@@ -594,7 +520,6 @@
     if (e.changedTouches && !findTouch(e.changedTouches)) return;
     joyActive = false;
     joyTouchId = null;
-    joyX = 0; joyY = 0;
     joystickKnob.style.left = '35px';
     joystickKnob.style.top = '35px';
     sendInput(0, 0);
@@ -643,6 +568,5 @@
 
   // ============ 启动 ============
   connect();
-  lastFrameTime = performance.now();
   requestAnimationFrame(render);
 })();
