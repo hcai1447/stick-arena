@@ -16,6 +16,14 @@
   const finalScoresEl = document.getElementById('finalScores');
   const playAgainBtn = document.getElementById('playAgainBtn');
 
+  // ============ 常量 ============
+  const PLAYER_SPEED = 3;
+  const INPUT_SEND_INTERVAL = 33;  // ~30fps
+  const CORRECT_SNAP_THRESHOLD = 80;  // 超过此距离直接修正
+  const CORRECT_LERP_RATE = 0.15;  // 小偏差每帧修正比例
+  const JOY_RADIUS = 50;
+  const JOY_DEADZONE = 0.12;
+
   // ============ 状态 ============
   let ws = null;
   let mySlot = -1;
@@ -30,51 +38,72 @@
   let particles = [];
   let shakeTimer = 0;
   let shakeIntensity = 0;
+  let connected = false;
 
-  // 远程玩家插值（所有玩家都用同一套，包括自己）
-  const interp = {}; // slot -> { prevX, prevY, curX, curY, curFacing, curMoving, curAttacking, t }
+  // ============ 客户端预测 (仅本地玩家) ============
+  const local = {
+    x: 0, y: 0,           // 预测位置
+    facing: 0,             // 预测朝向
+    moving: false,         // 是否在移动
+    inputX: 0, inputY: 0,  // 当前输入
+    alive: true,
+    hp: 5,
+    correctingX: 0,        // 平滑修正偏移
+    correctingY: 0,
+  };
 
-  // 输入
-  let currentInputX = 0, currentInputY = 0;
-  let lastInputSend = 0;
-  const INPUT_SEND_INTERVAL = 33;
+  // 输入序列号
+  let inputSeq = 0;
+  // 已发送但未被服务器确认的输入队列
+  const pendingInputs = [];  // { seq, x, y, facing }
 
-  // 虚拟摇杆
-  let joyActive = false;
-  let joyTouchId = null;
-  const JOY_RADIUS = 50;
+  // ============ 远程玩家插值 (其他玩家) ============
+  const interp = {};  // slot -> { prevX, prevY, curX, curY, curFacing, curMoving, curAttacking, t }
 
-  // ============ Canvas 自适应 ============
+  // ============ Canvas 自适应 + DPI ============
   function resizeCanvas() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    const dpr = window.devicePixelRatio || 1;
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
   window.addEventListener('resize', resizeCanvas);
   resizeCanvas();
 
+  function getViewW() { return window.innerWidth; }
+  function getViewH() { return window.innerHeight; }
+
   // ============ 缩放 ============
   function getScale() {
-    return Math.min(canvas.width / arena.w, canvas.height / arena.h);
+    return Math.min(getViewW() / arena.w, getViewH() / arena.h);
   }
   function getOffset() {
     const s = getScale();
-    return { x: (canvas.width - arena.w * s) / 2, y: (canvas.height - arena.h * s) / 2 };
+    return { x: (getViewW() - arena.w * s) / 2, y: (getViewH() - arena.h * s) / 2 };
   }
 
-  // ============ 平滑工具 ============
+  // ============ 工具 ============
   function lerp(a, b, t) { return a + (b - a) * Math.min(t, 1); }
 
   // ============ WebSocket ============
+  let inputTimer = null;
+
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}`);
 
     ws.onopen = () => {
+      connected = true;
       statusEl.textContent = '已连接服务器';
       joinBtn.disabled = false;
     };
     ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
     ws.onclose = () => {
+      connected = false;
       statusEl.textContent = '连接断开，3秒后重连...';
       setTimeout(connect, 3000);
     };
@@ -85,16 +114,148 @@
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
   }
 
+  // ============ 输入处理 ============
+  // 发送输入（带序列号，用于服务器和解）
   function sendInput(x, y) {
-    currentInputX = x;
-    currentInputY = y;
-    const now = Date.now();
-    if (now - lastInputSend >= INPUT_SEND_INTERVAL) {
-      lastInputSend = now;
-      send({ type: 'input', x, y });
+    local.inputX = x;
+    local.inputY = y;
+
+    // 更新本地预测朝向
+    const len = Math.sqrt(x * x + y * y);
+    if (len > JOY_DEADZONE) {
+      local.facing = Math.atan2(y, x);
+      local.moving = true;
+    } else {
+      local.moving = false;
     }
   }
 
+  // 固定频率向服务器发送输入（独立于渲染帧率）
+  function startInputLoop() {
+    if (inputTimer) return;
+    inputTimer = setInterval(() => {
+      if (!connected || mySlot < 0) return;
+
+      const x = local.inputX;
+      const y = local.inputY;
+      const seq = ++inputSeq;
+
+      send({ type: 'input', x, y, seq });
+
+      // 保存到待确认队列，用于和解
+      const len = Math.sqrt(x * x + y * y);
+      if (len > JOY_DEADZONE) {
+        const normX = (x / len) * PLAYER_SPEED;
+        const normY = (y / len) * PLAYER_SPEED;
+        pendingInputs.push({ seq, dx: normX, dy: normY });
+        // 限制队列长度（约1秒的数据）
+        if (pendingInputs.length > 60) pendingInputs.shift();
+      }
+    }, INPUT_SEND_INTERVAL);
+  }
+
+  // ============ 客户端预测 ============
+  function predictLocal() {
+    if (!local.alive) return;
+
+    const len = Math.sqrt(local.inputX * local.inputX + local.inputY * local.inputY);
+    if (len > JOY_DEADZONE) {
+      const normX = (local.inputX / len) * PLAYER_SPEED;
+      const normY = (local.inputY / len) * PLAYER_SPEED;
+      local.x += normX;
+      local.y += normY;
+      local.facing = Math.atan2(local.inputY, local.inputX);
+      local.moving = true;
+
+      // 边界
+      local.x = Math.max(12, Math.min(arena.w - 12, local.x));
+      local.y = Math.max(12, Math.min(arena.h - 12, local.y));
+
+      // 墙壁
+      for (const w of walls) {
+        const cx = Math.max(w.x, Math.min(local.x, w.x + w.w));
+        const cy = Math.max(w.y, Math.min(local.y, w.y + w.h));
+        const dx = local.x - cx;
+        const dy = local.y - cy;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 12 && dist > 0) {
+          local.x = cx + (dx / dist) * 12;
+          local.y = cy + (dy / dist) * 12;
+        }
+      }
+    } else {
+      local.moving = false;
+    }
+
+    // 平滑修正
+    local.x += local.correctingX;
+    local.y += local.correctingY;
+    local.correctingX *= 0.85;
+    local.correctingY *= 0.85;
+    if (Math.abs(local.correctingX) < 0.1) local.correctingX = 0;
+    if (Math.abs(local.correctingY) < 0.1) local.correctingY = 0;
+  }
+
+  // ============ 服务器和解 ============
+  function reconcileWithServer(serverPlayer) {
+    if (mySlot < 0) return;
+
+    // 移除已确认的输入
+    const ackedSeq = serverPlayer.lastInputSeq || 0;
+    while (pendingInputs.length > 0 && pendingInputs[0].seq <= ackedSeq) {
+      pendingInputs.shift();
+    }
+
+    // 服务器位置是权威基准
+    const serverX = serverPlayer.x;
+    const serverY = serverPlayer.y;
+
+    // 从服务器位置开始，重放未确认的输入
+    let replayX = serverX;
+    let replayY = serverY;
+    for (const inp of pendingInputs) {
+      replayX += inp.dx;
+      replayY += inp.dy;
+      // 边界
+      replayX = Math.max(12, Math.min(arena.w - 12, replayX));
+      replayY = Math.max(12, Math.min(arena.h - 12, replayY));
+      // 墙壁
+      for (const w of walls) {
+        const cx = Math.max(w.x, Math.min(replayX, w.x + w.w));
+        const cy = Math.max(w.y, Math.min(replayY, w.y + w.h));
+        const dx = replayX - cx;
+        const dy = replayY - cy;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 12 && dist > 0) {
+          replayX = cx + (dx / dist) * 12;
+          replayY = cy + (dy / dist) * 12;
+        }
+      }
+    }
+
+    // 比较重放位置和当前预测位置
+    const driftX = replayX - local.x;
+    const driftY = replayY - local.y;
+    const drift = Math.sqrt(driftX * driftX + driftY * driftY);
+
+    if (drift > CORRECT_SNAP_THRESHOLD) {
+      // 大偏差：直接修正
+      local.x = replayX;
+      local.y = replayY;
+      local.correctingX = 0;
+      local.correctingY = 0;
+    } else if (drift > 0.5) {
+      // 小偏差：平滑修正
+      local.correctingX += driftX * CORRECT_LERP_RATE;
+      local.correctingY += driftY * CORRECT_LERP_RATE;
+    }
+
+    // 同步服务端权威状态（非位置）
+    local.alive = serverPlayer.alive;
+    local.hp = serverPlayer.hp;
+  }
+
+  // ============ 消息处理 ============
   function handleMessage(msg) {
     switch (msg.type) {
       case 'joined':
@@ -106,6 +267,7 @@
         lobbyEl.style.display = 'none';
         gameEl.style.display = 'block';
         resizeCanvas();
+        startInputLoop();
         break;
 
       case 'playerJoined':
@@ -123,32 +285,45 @@
         gameOverEl.style.display = 'none';
         particles = [];
         for (const key in interp) delete interp[key];
+        pendingInputs.length = 0;
+        inputSeq = 0;
+        local.correctingX = 0;
+        local.correctingY = 0;
         break;
 
       case 'state':
-        // 服务器是唯一权威，所有玩家位置都用插值平滑
         for (const p of msg.players) {
           if (p.name) names[p.slot] = p.name;
 
-          if (!interp[p.slot]) {
-            interp[p.slot] = {
-              prevX: p.x, prevY: p.y,
-              curX: p.x, curY: p.y,
-              curFacing: p.facing, curMoving: p.moving,
-              curAttacking: p.attacking,
-              t: 1
-            };
+          if (p.slot === mySlot) {
+            // === 本地玩家：服务器和解 ===
+            if (local.x === 0 && local.y === 0 && p.alive) {
+              // 首次同步
+              local.x = p.x;
+              local.y = p.y;
+            }
+            reconcileWithServer(p);
           } else {
-            const s = interp[p.slot];
-            // 保存上一个位置作为插值起点
-            s.prevX = getInterpX(p.slot);
-            s.prevY = getInterpY(p.slot);
-            s.curX = p.x;
-            s.curY = p.y;
-            s.curFacing = p.facing;
-            s.curMoving = p.moving;
-            s.curAttacking = p.attacking;
-            s.t = 0; // 重置插值
+            // === 远程玩家：插值 ===
+            if (!interp[p.slot]) {
+              interp[p.slot] = {
+                prevX: p.x, prevY: p.y,
+                curX: p.x, curY: p.y,
+                curFacing: p.facing, curMoving: p.moving,
+                curAttacking: p.attacking,
+                t: 1
+              };
+            } else {
+              const s = interp[p.slot];
+              s.prevX = getInterpX(p.slot);
+              s.prevY = getInterpY(p.slot);
+              s.curX = p.x;
+              s.curY = p.y;
+              s.curFacing = p.facing;
+              s.curMoving = p.moving;
+              s.curAttacking = p.attacking;
+              s.t = 0;
+            }
           }
         }
         gameState = msg.players;
@@ -183,7 +358,7 @@
     }
   }
 
-  // 获取插值后的当前位置
+  // ============ 插值工具（远程玩家） ============
   function getInterpX(slot) {
     const s = interp[slot];
     if (!s) return 0;
@@ -195,15 +370,28 @@
     return lerp(s.prevY, s.curY, s.t);
   }
 
-  // 获取渲染状态
+  // ============ 获取渲染状态 ============
   function getRenderState(slot) {
     if (!gameState) return null;
+
+    if (slot === mySlot) {
+      // 本地玩家用预测位置
+      const base = gameState.find(p => p.slot === slot);
+      return {
+        ...(base || {}),
+        x: local.x,
+        y: local.y,
+        facing: local.facing,
+        moving: local.moving,
+        alive: local.alive,
+        hp: local.hp,
+      };
+    }
+
     const base = gameState.find(p => p.slot === slot);
     if (!base) return null;
-
     const s = interp[slot];
     if (!s) return base;
-
     return {
       ...base,
       x: lerp(s.prevX, s.curX, s.t),
@@ -294,7 +482,7 @@
     if (hp <= 1 && animFrame % 10 < 5) ctx.globalAlpha = 0.5;
     if (attacking) { ctx.shadowColor = color; ctx.shadowBlur = 15 * s; }
 
-    // 动画：速度决定摆动频率
+    // 速度决定摆动频率
     const speed = Math.sqrt(velX * velX + velY * velY);
     const walkPhase = moving ? (animFrame * 0.15 * Math.max(speed, 1)) : 0;
     const walkCycle = Math.sin(walkPhase);
@@ -423,11 +611,14 @@
     animFrame++;
     updateParticles();
 
-    // 推进所有插值
+    // 推进远程玩家插值
     for (const slot in interp) {
       const s = interp[slot];
-      if (s.t < 1) s.t = Math.min(1, s.t + 0.2); // 5帧插值完
+      if (s.t < 1) s.t = Math.min(1, s.t + 0.2);
     }
+
+    // 客户端预测
+    predictLocal();
 
     // 屏幕震动
     let sx = 0, sy = 0;
@@ -441,7 +632,7 @@
     ctx.translate(sx, sy);
 
     ctx.fillStyle = '#1a1a2e';
-    ctx.fillRect(-10, -10, canvas.width + 20, canvas.height + 20);
+    ctx.fillRect(-10, -10, getViewW() + 20, getViewH() + 20);
 
     drawArena();
     drawParticles();
@@ -450,13 +641,23 @@
       for (const base of gameState) {
         const p = getRenderState(base.slot);
         if (!p) continue;
-        // 速度方向用于身体倾斜
-        const st = interp[base.slot];
+
         let velX = 0, velY = 0;
-        if (st) {
-          velX = st.curX - st.prevX;
-          velY = st.curY - st.prevY;
+        if (base.slot === mySlot) {
+          // 本地玩家用预测速度
+          const len = Math.sqrt(local.inputX * local.inputX + local.inputY * local.inputY);
+          if (len > JOY_DEADZONE) {
+            velX = (local.inputX / len) * PLAYER_SPEED;
+            velY = (local.inputY / len) * PLAYER_SPEED;
+          }
+        } else {
+          const st = interp[base.slot];
+          if (st) {
+            velX = st.curX - st.prevX;
+            velY = st.curY - st.prevY;
+          }
         }
+
         drawStickFigure(
           p.x, p.y, p.facing, colors[p.slot],
           p.moving, p.alive, p.attacking, p.hp, p.slot,
@@ -470,6 +671,9 @@
   }
 
   // ============ 虚拟摇杆 ============
+  let joyActive = false;
+  let joyTouchId = null;
+
   function findTouch(touches) {
     if (joyTouchId === 'mouse') return null;
     for (let i = 0; i < touches.length; i++) {
@@ -488,7 +692,12 @@
     if (dist > JOY_RADIUS) { dx = (dx / dist) * JOY_RADIUS; dy = (dy / dist) * JOY_RADIUS; }
     joystickKnob.style.left = (35 + dx) + 'px';
     joystickKnob.style.top = (35 + dy) + 'px';
-    sendInput(dx / JOY_RADIUS, dy / JOY_RADIUS);
+
+    let nx = dx / JOY_RADIUS;
+    let ny = dy / JOY_RADIUS;
+    // 死区
+    if (Math.sqrt(nx * nx + ny * ny) < JOY_DEADZONE) { nx = 0; ny = 0; }
+    sendInput(nx, ny);
   }
 
   function handleJoyStart(e) {
@@ -533,8 +742,18 @@
   joystickBase.addEventListener('touchstart', handleJoyStart, { passive: false });
   joystickBase.addEventListener('mousedown', handleJoyStart);
 
-  attackBtn.addEventListener('touchstart', (e) => { e.preventDefault(); e.stopPropagation(); send({ type: 'attack' }); }, { passive: false });
-  attackBtn.addEventListener('click', (e) => { e.preventDefault(); send({ type: 'attack' }); });
+  // ============ 攻击 ============
+  attackBtn.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    send({ type: 'attack' });
+    attackBtn.style.transform = 'scale(0.85)';
+    setTimeout(() => { attackBtn.style.transform = ''; }, 100);
+  }, { passive: false });
+  attackBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    send({ type: 'attack' });
+  });
 
   // ============ 键盘 ============
   const keysDown = new Set();

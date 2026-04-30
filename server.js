@@ -238,6 +238,7 @@ function gameTick(room) {
       moving: p.vx !== 0 || p.vy !== 0,
       score: p.score || 0,
       attacking: p.attackCooldown > ATTACK_COOLDOWN_MS * 0.6,
+      lastInputSeq: p.lastInputSeq || 0,
     })),
     t: now,
   });
@@ -276,6 +277,7 @@ wss.on('connection', (ws) => {
         attackCooldown: 0, wantsAttack: false,
         respawnTimer: 0,
         score: 0,
+        lastInputSeq: 0,
       };
       room.players.set(slot, playerData);
       currentRoom = room;
@@ -319,6 +321,7 @@ wss.on('connection', (ws) => {
     if (msg.type === 'input' && currentRoom && playerData) {
       playerData.inputX = msg.x || 0;
       playerData.inputY = msg.y || 0;
+      if (msg.seq !== undefined) playerData.lastInputSeq = msg.seq;
     }
 
     if (msg.type === 'attack' && currentRoom && playerData) {
