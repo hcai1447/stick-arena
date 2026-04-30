@@ -35,7 +35,7 @@
   let shakeIntensity = 0;
 
   // 客户端预测
-  let localX = 0, localY = 0;
+  let localX = 0, localY = 0, localFacing = 0;
   let localInputX = 0, localInputY = 0;
   let lastServerX = 0, lastServerY = 0;
   let lastInputSend = 0;
@@ -138,12 +138,10 @@
         for (const p of msg.players) {
           if (p.name) names[p.slot] = p.name;
           if (p.slot === mySlot) {
-            // 校正本地位置（平滑过渡）
             lastServerX = p.x;
             lastServerY = p.y;
             const dx = p.x - localX;
             const dy = p.y - localY;
-            // 如果偏差太大直接同步，否则平滑修正
             if (Math.abs(dx) > 30 || Math.abs(dy) > 30) {
               localX = p.x;
               localY = p.y;
@@ -151,8 +149,11 @@
               localX += dx * 0.3;
               localY += dy * 0.3;
             }
+            // 不覆盖本地facing和moving，由预测控制
             p.x = localX;
             p.y = localY;
+            p.facing = localFacing;
+            p.moving = (localInputX !== 0 || localInputY !== 0);
           }
         }
         gameState = msg.players;
@@ -216,19 +217,21 @@
     if (!me || !me.alive) return;
 
     const len = Math.sqrt(localInputX * localInputX + localInputY * localInputY);
-    if (len > 0) {
+    if (len > 0.1) {
       localX += (localInputX / len) * PLAYER_SPEED;
       localY += (localInputY / len) * PLAYER_SPEED;
+      localFacing = Math.atan2(localInputY, localInputX);
     }
 
     // 边界
     localX = Math.max(12, Math.min(arena.w - 12, localX));
     localY = Math.max(12, Math.min(arena.h - 12, localY));
 
+    // 所有渲染相关属性都用本地值
     me.x = localX;
     me.y = localY;
-    me.moving = len > 0;
-    if (len > 0) me.facing = Math.atan2(localInputY, localInputX);
+    me.facing = localFacing;
+    me.moving = len > 0.1;
   }
 
   // ============ 粒子效果 ============
