@@ -1,0 +1,13 @@
+{
+  "name": "stick-arena",
+  "version": "1.0.0",
+  "description": "火柴人大乱斗 - 4人联机对战小游戏",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0",
+    "ws": "^8.16.0"
+  }
+}

@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>火柴人大乱斗</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 大厅 -->
+  <div id="lobby">
+    <h1>火柴人大乱斗</h1>
+    <p>4人联机 · 像素风格</p>
+    <input type="text" id="nameInput" placeholder="输入你的昵称" maxlength="6">
+    <button id="joinBtn">加入游戏</button>
+    <p id="status">等待连接...</p>
+  </div>
+
+  <!-- 游戏 -->
+  <div id="game" style="display:none">
+    <canvas id="canvas"></canvas>
+    <div id="hud">
+      <div id="scores"></div>
+    </div>
+    <!-- 虚拟摇杆 -->
+    <div id="joystickArea">
+      <div id="joystickBase">
+        <div id="joystickKnob"></div>
+      </div>
+    </div>
+    <!-- 攻击按钮 -->
+    <div id="attackBtn">攻击</div>
+    <!-- 游戏结束弹窗 -->
+    <div id="gameOver" style="display:none">
+      <div id="gameOverContent">
+        <h2 id="winnerText"></h2>
+        <div id="finalScores"></div>
+        <button id="playAgainBtn">再来一局</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="game.js"></script>
+</body>
+</html>
